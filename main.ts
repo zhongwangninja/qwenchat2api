@@ -1,47 +1,77 @@
 /**
  * Qwen API to OpenAI Standard - Single File Deno Deploy/Playground Script
  *
- * @version 2.3
+ * @version 2.6
  * @description This script acts as a proxy, converting standard OpenAI API requests
  * into the proprietary format used by `chat.qwen.ai` and transforms the response
  * back into the standard OpenAI format. It incorporates the specific logic
  * found in the original Qwen2API Node.js repository.
  *
+ * 🎯 **ZERO CONFIGURATION REQUIRED** - No environment variables needed!
+ * 🔒 **OPTIONAL SECURITY** - Add SALT for access control!
+ * All authentication information is provided by clients via Authorization header.
  *
  * --- DEPLOYMENT INSTRUCTIONS ---
  *
  * 1. **Deno Deploy / Playground Setup**:
  *    - Create a new project in Deno Deploy.
  *    - Copy and paste this entire script into the editor.
+ *    - Deploy immediately - no configuration needed!
  *
- * 2. **Set Environment Variables**:
- *    In your Deno Deploy project settings, add the following environment variables:
+ * 2. **Optional Security (Environment Variable)**:
+ *    - `SALT`: (Optional) A secret salt value for access control.
+ *              If set, clients must include this salt in their requests.
+ *              Example: `my_secret_salt_123`
  *
- *    - `OPENAI_API_KEY`: (Recommended) Your secret key for clients to access this proxy.
- *                        If not set, the proxy will be open to the public.
- *                        Example: `sk-my-secret-key-12345`
+ * 3. **Client Usage**:
+ *    
+ *    **Without SALT (Open Access):**
+ *    ```
+ *    Authorization: Bearer qwen_token;ssxmod_itna_value
+ *    ```
+ *    
+ *    **With SALT (Restricted Access):**
+ *    ```
+ *    Authorization: Bearer salt_value;qwen_token;ssxmod_itna_value
+ *    ```
+ *    
+ *    **Examples:**
+ *    ```bash
+ *    # Open access mode
+ *    Authorization: Bearer ey...abc;mqUxRDBD...DYAEDBYD74G+DDeDixGm...
+ *    
+ *    # Restricted access mode (if SALT=my_secret)
+ *    Authorization: Bearer my_secret;ey...abc;mqUxRDBD...DYAEDBYD74G+DDeDixGm...
+ *    ```
  *
- *    - `API_KEY`: Your Qwen account token(s) for the upstream API. You can provide
- *                 multiple tokens separated by commas. The script will rotate through them.
- *                 This is a **required** variable.
- *                 Example: `ey...abc,ey...def`
- *
- *    - `SSXMOD_ITNA`: The special cookie value required for the upstream API.
- *                     This may be required for certain models or features.
- *                     Example: `mqUxRDBD...DYAEDBYD74G+DDeDixGm...`
- *
- * 3. **Run**:
- *    The script will automatically run upon deployment.
+ * 4. **Run**:
+ *    The script will be deployed and run automatically. Your endpoint URL will be provided by Deno Deploy.
  *
  * --- LOCAL USAGE ---
  *
  * 1. Save this file as `main.ts`.
- * 2. Set environment variables in your terminal:
- *    export OPENAI_API_KEY="your_secret_proxy_key"
- *    export API_KEY="your_qwen_token"
- *    export SSXMOD_ITNA="your_cookie_value"
+ * 2. Optionally set environment variable for security:
+ *    ```bash
+ *    export SALT="your_secret_salt"  # Optional for access control
+ *    ```
  * 3. Run the script:
+ *    ```bash
  *    deno run --allow-net --allow-env main.ts
+ *    ```
+ * 4. Use with curl:
+ *    ```bash
+ *    # Without SALT
+ *    curl -X POST http://localhost:8000/v1/chat/completions \
+ *      -H "Authorization: Bearer your_qwen_token;your_ssxmod_itna" \
+ *      -H "Content-Type: application/json" \
+ *      -d '{"model":"qwen3-max","messages":[{"role":"user","content":"Hello"}]}'
+ *    
+ *    # With SALT
+ *    curl -X POST http://localhost:8000/v1/chat/completions \
+ *      -H "Authorization: Bearer your_salt;your_qwen_token;your_ssxmod_itna" \
+ *      -H "Content-Type: application/json" \
+ *      -d '{"model":"qwen3-max","messages":[{"role":"user","content":"Hello"}]}'
+ *    ```
  *
  * --- ABOUT DENO ---
  * Deno is a modern and secure runtime for JavaScript and TypeScript.
@@ -53,221 +83,14 @@
 
 import { Application, Router, Context, Middleware } from "https://deno.land/x/oak@v12.6.1/mod.ts";
 import { Buffer } from "https://deno.land/std@0.177.0/io/buffer.ts";
-import { S3Client } from "https://deno.land/x/s3_lite_client@0.7.0/mod.ts";
-import { decode } from "https://deno.land/std@0.208.0/encoding/base64.ts";
-
-
-// --- 1.5. Qwen OSS Upload Logic ---
-
-const UPLOAD_CONFIG = {
-  stsTokenUrl: 'https://chat.qwen.ai/api/v1/files/getstsToken',
-  maxRetries: 3,
-  timeout: 30000,
-};
-
-/**
- * Requests a temporary STS Token from the Qwen API for file uploads.
- * Mimics the logic from `requestStsToken` in `upload.js`.
- */
-async function requestStsToken(filename: string, filesize: number, filetype: string, authToken: string, retryCount = 0): Promise<any> {
-    const bearerToken = authToken.startsWith('Bearer ') ? authToken : `Bearer ${authToken}`;
-    const payload = { filename, filesize, filetype };
-
-    try {
-        const response = await fetch(UPLOAD_CONFIG.stsTokenUrl, {
-            method: 'POST',
-            headers: {
-                'Authorization': bearerToken,
-                'Content-Type': 'application/json',
-                'x-request-id': crypto.randomUUID(),
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            },
-            body: JSON.stringify(payload),
-        });
-
-        if (response.ok) {
-            const stsData = await response.json();
-            // Basic validation
-            if (stsData.access_key_id && stsData.file_url && stsData.bucketname) {
-                return stsData;
-            }
-            throw new Error("Incomplete STS token response received.");
-        }
-
-        throw new Error(`Failed to get STS token: ${response.status} ${response.statusText}`);
-
-    } catch (error) {
-        if (retryCount < UPLOAD_CONFIG.maxRetries) {
-            console.warn(`STS token request failed, retrying (${retryCount + 1}/${UPLOAD_CONFIG.maxRetries})...`, error.message);
-            await new Promise(res => setTimeout(res, 1000 * Math.pow(2, retryCount)));
-            return requestStsToken(filename, filesize, filetype, authToken, retryCount + 1);
-        }
-        console.error("Failed to get STS token after multiple retries.", error);
-        throw error;
-    }
-}
-
-/**
- * Uploads a file to Qwen's Alibaba Cloud OSS using STS credentials.
- * @param fileBuffer The file content as a Uint8Array.
- * @param originalFilename The original name of the file.
- * @param qwenAuthToken The Qwen authorization token.
- * @returns The URL and ID of the uploaded file.
- */
-async function uploadFileToQwenOss(fileBuffer: Uint8Array, originalFilename: string, qwenAuthToken: string): Promise<{ file_url: string, file_id: string }> {
-    const filesize = fileBuffer.length;
-    const mimeType = originalFilename.endsWith('.png') ? 'image/png' :
-                     originalFilename.endsWith('.jpg') || originalFilename.endsWith('.jpeg') ? 'image/jpeg' :
-                     'application/octet-stream';
-    const filetypeSimple = mimeType.startsWith('image/') ? 'image' : 'file';
-
-    // 1. Get STS Token
-    const stsData = await requestStsToken(originalFilename, filesize, filetypeSimple, qwenAuthToken);
-
-    const stsCredentials = {
-        accessKeyID: stsData.access_key_id,
-        secretKey: stsData.access_key_secret,
-        sessionToken: stsData.security_token,
-    };
-    const ossInfo = {
-        bucket: stsData.bucketname,
-        endpoint: stsData.region + '.aliyuncs.com',
-        path: stsData.file_path,
-        region: stsData.region,
-    };
-
-    // 2. Upload to OSS using S3Client from s3_lite_client
-    const s3Client = new S3Client({
-        accessKeyID: stsCredentials.accessKeyID,
-        secretKey: stsCredentials.secretKey,
-        sessionToken: stsCredentials.sessionToken,
-        bucket: ossInfo.bucket,
-        region: ossInfo.region,
-        endpointURL: `https://${ossInfo.endpoint}`,
-    });
-
-    await s3Client.putObject(ossInfo.path, fileBuffer, {
-        contentType: mimeType,
-    });
-
-    return {
-        file_url: stsData.file_url,
-        file_id: stsData.file_id,
-    };
-}
-
 
 // --- 1. Configuration from Environment Variables ---
 
 const config = {
-    openaiApiKey: Deno.env.get("OPENAI_API_KEY") || "",
-    apiKeys: (Deno.env.get("API_KEY") || "").split(',').map(k => k.trim()).filter(Boolean),
-    ssxmodItna: Deno.env.get("SSXMOD_ITNA") || "",
+  salt: Deno.env.get("SALT") || "",
 };
 
-if (config.apiKeys.length === 0) {
-    console.error("FATAL: API_KEY environment variable is not set or empty. This is required for the upstream Qwen API.");
-    Deno.exit(1);
-}
-
-if (!config.openaiApiKey) {
-    console.warn("WARNING: OPENAI_API_KEY is not set. The proxy will be open to the public.");
-}
-
-// Simple token rotator for upstream API
-let tokenIndex = 0;
-function getUpstreamToken(): string {
-    if (config.apiKeys.length === 0) return "";
-    const token = config.apiKeys[tokenIndex];
-    tokenIndex = (tokenIndex + 1) % config.apiKeys.length;
-    return token;
-}
-
 // --- 2. Core Conversion Logic (from original Node.js project analysis) ---
-
-/**
- * Asynchronously processes OpenAI messages to handle multimodal content for Qwen.
- * If a base64 image is found, it's uploaded to OSS, and the message content is updated.
- * @param messages The array of messages from the OpenAI request.
- * @param qwenAuthToken The token needed to authenticate with the Qwen upload API.
- * @returns A promise that resolves to a new array of messages formatted for Qwen.
- */
-async function processMessagesForQwen(messages: any[], qwenAuthToken: string): Promise<any[]> {
-    if (!messages || !Array.isArray(messages)) {
-        return [];
-    }
-
-    const processedMessages = [];
-    for (const message of messages) {
-        if (message.role === 'user' && Array.isArray(message.content)) {
-            const newContent = [];
-            let hasImage = false;
-
-            for (const part of message.content) {
-                if (part.type === 'image_url' && part.image_url?.url?.startsWith('data:')) {
-                    hasImage = true;
-                    const base64Data = part.image_url.url;
-                    const match = base64Data.match(/^data:(image\/\w+);base64,(.*)$/);
-                    if (!match) {
-                        console.warn("Skipping invalid base64 image data.");
-                        newContent.push({ type: 'text', text: '[Invalid Image Data]' });
-                        continue;
-                    }
-
-                    const [, mimeType, base64] = match;
-                    const fileExtension = mimeType.split('/')[1] || 'png';
-                    const filename = `${crypto.randomUUID()}.${fileExtension}`;
-                    const buffer = decode(base64);
-
-                    try {
-                        const uploadResult = await uploadFileToQwenOss(buffer, filename, qwenAuthToken);
-                        // Replace with Qwen's expected format for uploaded images
-                        newContent.push({ type: 'image', image: uploadResult.file_url });
-                    } catch (e) {
-                        console.error("Failed to upload image to Qwen OSS:", e);
-                        newContent.push({ type: 'text', text: `[Image upload failed: ${e.message}]` });
-                    }
-                } else if (part.type === 'image_url') {
-                    // It's a regular URL, convert to markdown format as a fallback.
-                    newContent.push({ type: 'text', text: `![]( ${part.image_url.url} )` });
-                } else {
-                    newContent.push(part);
-                }
-            }
-            // If there was an image, Qwen expects content to be an array.
-            // If not, it should be a string. This logic might need refinement based on Qwen API behavior.
-            if (hasImage) {
-                 // Flatten text parts into a single string if mixed with images
-                const flattenedContent = [];
-                let textParts = [];
-                for(const item of newContent) {
-                    if (item.type === 'text') {
-                        textParts.push(item.text);
-                    } else {
-                        if (textParts.length > 0) {
-                            flattenedContent.push({ type: 'text', text: textParts.join('\n') });
-                            textParts = [];
-                        }
-                        flattenedContent.push(item);
-                    }
-                }
-                if (textParts.length > 0) {
-                    flattenedContent.push({ type: 'text', text: textParts.join('\n') });
-                }
-                processedMessages.push({ ...message, content: flattenedContent });
-            } else {
-                 // No images, just combine text parts into a single string.
-                const combinedText = message.content.filter(p => p.type === 'text').map(p => p.text).join('\n');
-                processedMessages.push({ ...message, content: combinedText });
-            }
-
-        } else {
-            processedMessages.push(message);
-        }
-    }
-    return processedMessages;
-}
-
 
 /**
  * Transforms an OpenAI-formatted request body into the proprietary Qwen format.
@@ -276,32 +99,32 @@ async function processMessagesForQwen(messages: any[], qwenAuthToken: string): P
  * @returns A request body for the `chat.qwen.ai` API.
  */
 function transformOpenAIRequestToQwen(openAIRequest: any): any {
-    const model = openAIRequest.model || "qwen-max";
+  const model = openAIRequest.model || "qwen-max";
 
-    // Determine chat_type from model suffix
-    let chat_type = 't2t';
-    if (model.includes('-search')) chat_type = 'search';
-    if (model.includes('-image')) chat_type = 't2i';
-    if (model.includes('-video')) chat_type = 't2v';
+  // Determine chat_type from model suffix
+  let chat_type = 't2t';
+  if (model.includes('-search')) chat_type = 'search';
+  if (model.includes('-image')) chat_type = 't2i';
+  if (model.includes('-video')) chat_type = 't2v';
 
-    // Clean the model name
-    const qwenModel = model.replace(/-search|-thinking|-image|-video/g, '');
+  // Clean the model name
+  const qwenModel = model.replace(/-search|-thinking|-image|-video/g, '');
 
-    const qwenBody = {
-        "model": qwenModel,
-        "messages": openAIRequest.messages, // Messages are now pre-processed
-        "stream": true,
-        "incremental_output": true,
-        "chat_type": chat_type,
-        "session_id": crypto.randomUUID(),
-        "chat_id": crypto.randomUUID(),
-        "feature_config": {
-            "output_schema": "phase",
-            "thinking_enabled": model.includes('-thinking'),
-        }
-    };
+  const qwenBody = {
+    "model": qwenModel,
+    "messages": openAIRequest.messages, // Simplified message parsing for playground
+    "stream": true,
+    "incremental_output": true,
+    "chat_type": chat_type,
+    "session_id": crypto.randomUUID(),
+    "chat_id": crypto.randomUUID(),
+    "feature_config": {
+      "output_schema": "phase",
+      "thinking_enabled": model.includes('-thinking'),
+    }
+  };
 
-    return qwenBody;
+  return qwenBody;
 }
 
 /**
@@ -310,60 +133,60 @@ function transformOpenAIRequestToQwen(openAIRequest: any): any {
  * This mimics the logic from `handleStreamResponse` in `chat.js`.
  */
 function createQwenToOpenAIStreamTransformer(): TransformStream<Uint8Array, Uint8Array> {
-    const decoder = new TextDecoder();
-    const encoder = new TextEncoder();
-    let buffer = '';
-    const messageId = crypto.randomUUID();
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  let buffer = '';
+  const messageId = crypto.randomUUID();
 
-    return new TransformStream({
-        transform(chunk, controller) {
-            buffer += decoder.decode(chunk, { stream: true });
+  return new TransformStream({
+    transform(chunk, controller) {
+      buffer += decoder.decode(chunk, { stream: true });
 
-            const lines = buffer.split('\n\n');
-            buffer = lines.pop() || ''; // Keep partial line
+      const lines = buffer.split('\n\n');
+      buffer = lines.pop() || ''; // Keep partial line
 
-            for (const line of lines) {
-                if (!line.startsWith('data:')) continue;
+      for (const line of lines) {
+        if (!line.startsWith('data:')) continue;
 
-                try {
-                    const qwenChunk = JSON.parse(line.substring(5));
-                    if (!qwenChunk.choices || qwenChunk.choices.length === 0) continue;
+        try {
+          const qwenChunk = JSON.parse(line.substring(5));
+          if (!qwenChunk.choices || qwenChunk.choices.length === 0) continue;
 
-                    const delta = qwenChunk.choices[0].delta;
-                    if (!delta) continue;
+          const delta = qwenChunk.choices[0].delta;
+          if (!delta) continue;
 
-                    let content = delta.content || "";
+          let content = delta.content || "";
 
-                    // Handle special <think> tags
-                    if (delta.phase === 'think' && !buffer.includes('<think>')) {
-                        content = `<think>\n${content}`;
-                    }
-                    if (delta.phase === 'answer' && buffer.includes('<think>') && !buffer.includes('</think>')) {
-                        content = `\n</think>\n${content}`;
-                    }
+          // Handle special <think> tags
+          if (delta.phase === 'think' && !buffer.includes('<think>')) {
+            content = `<think>\n${content}`;
+          }
+          if (delta.phase === 'answer' && buffer.includes('<think>') && !buffer.includes('</think>')) {
+            content = `\n</think>\n${content}`;
+          }
 
-                    const openAIChunk = {
-                        id: `chatcmpl-${messageId}`,
-                        object: "chat.completion.chunk",
-                        created: Math.floor(Date.now() / 1000),
-                        model: qwenChunk.model || "qwen",
-                        choices: [{
-                            index: 0,
-                            delta: { content: content },
-                            finish_reason: qwenChunk.choices[0].finish_reason || null,
-                        }],
-                    };
-                    controller.enqueue(encoder.encode(`data: ${JSON.stringify(openAIChunk)}\n\n`));
-                } catch (e) {
-                    console.error("Error parsing Qwen stream chunk:", e);
-                }
-            }
-        },
-        flush(controller) {
-            // Send the final DONE message
-            controller.enqueue(encoder.encode(`data: [DONE]\n\n`));
-        },
-    });
+          const openAIChunk = {
+            id: `chatcmpl-${messageId}`,
+            object: "chat.completion.chunk",
+            created: Math.floor(Date.now() / 1000),
+            model: qwenChunk.model || "qwen",
+            choices: [{
+              index: 0,
+              delta: { content: content },
+              finish_reason: qwenChunk.choices[0].finish_reason || null,
+            }],
+          };
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(openAIChunk)}\n\n`));
+        } catch (e) {
+          console.error("Error parsing Qwen stream chunk:", e);
+        }
+      }
+    },
+    flush(controller) {
+      // Send the final DONE message
+      controller.enqueue(encoder.encode(`data: [DONE]\n\n`));
+    },
+  });
 }
 
 // --- 3. Oak Application and Routes ---
@@ -373,39 +196,97 @@ const router = new Router();
 
 // Middleware for logging and error handling
 app.use(async (ctx, next) => {
-    try {
-        await next();
-    } catch (err) {
-        console.error(`Unhandled error: ${err.message}`);
-        ctx.response.status = 500;
-        ctx.response.body = { error: "Internal Server Error" };
-    }
-    console.log(`${ctx.request.method} ${ctx.request.url} - ${ctx.response.status}`);
+  try {
+    await next();
+  } catch (err) {
+    console.error(`Unhandled error: ${err.message}`);
+    ctx.response.status = 500;
+    ctx.response.body = { error: "Internal Server Error" };
+  }
+  console.log(`${ctx.request.method} ${ctx.request.url} - ${ctx.response.status}`);
 });
 
 // Middleware for Authentication
 const authMiddleware: Middleware = async (ctx, next) => {
-    // Skip auth for the root informational page
-    if (ctx.request.url.pathname === '/') {
-        await next();
-        return;
+  // Skip auth for the root informational page
+  if (ctx.request.url.pathname === '/') {
+    await next();
+    return;
+  }
+
+  const authHeader = ctx.request.headers.get("Authorization");
+  const clientToken = authHeader?.replace(/^Bearer\s+/, '');
+
+  if (!clientToken) {
+    const expectedFormat = config.salt
+      ? "Authorization: Bearer salt_value;qwen_token;ssxmod_itna_value"
+      : "Authorization: Bearer qwen_token;ssxmod_itna_value";
+
+    ctx.response.status = 401;
+    ctx.response.body = {
+      error: "Unauthorized. Authorization header required.",
+      format: `Use: ${expectedFormat}`,
+      salt_required: !!config.salt
+    };
+    return;
+  }
+
+  // Parse the token format based on whether SALT is configured
+  const parts = clientToken.split(';');
+  let qwenToken: string;
+  let ssxmodItna: string;
+
+  if (config.salt) {
+    // Format: salt;qwen_token;ssxmod_itna_value
+    if (parts.length < 2) {
+      ctx.response.status = 401;
+      ctx.response.body = {
+        error: "Invalid token format. Salt, token and optional cookie required.",
+        format: "Use: Authorization: Bearer salt_value;qwen_token;ssxmod_itna_value",
+        salt_required: true
+      };
+      return;
     }
 
-    if (!config.openaiApiKey) {
-        // If no key is configured on the server, allow requests but log a warning.
-        await next();
-        return;
+    const providedSalt = parts[0]?.trim();
+    if (providedSalt !== config.salt) {
+      ctx.response.status = 401;
+      ctx.response.body = {
+        error: "Invalid salt value.",
+        format: "Use: Authorization: Bearer salt_value;qwen_token;ssxmod_itna_value",
+        salt_required: true
+      };
+      return;
     }
 
-    const authHeader = ctx.request.headers.get("Authorization");
-    const clientToken = authHeader?.replace(/^Bearer\s+/, '');
+    qwenToken = parts[1]?.trim();
+    ssxmodItna = parts[2]?.trim() || '';
+  } else {
+    // Format: qwen_token;ssxmod_itna_value
+    qwenToken = parts[0]?.trim();
+    ssxmodItna = parts[1]?.trim() || '';
+  }
 
-    if (clientToken === config.openaiApiKey) {
-        await next();
-    } else {
-        ctx.response.status = 401;
-        ctx.response.body = { error: "Unauthorized. Invalid API key provided." };
-    }
+  if (!qwenToken) {
+    const expectedFormat = config.salt
+      ? "Authorization: Bearer salt_value;qwen_token;ssxmod_itna_value"
+      : "Authorization: Bearer qwen_token;ssxmod_itna_value";
+
+    ctx.response.status = 401;
+    ctx.response.body = {
+      error: "Invalid token format. Qwen token is required.",
+      format: `Use: ${expectedFormat}`,
+      salt_required: !!config.salt
+    };
+    return;
+  }
+
+  // Store parsed values in context state for use in routes
+  ctx.state = ctx.state || {};
+  ctx.state.qwenToken = qwenToken;
+  ctx.state.ssxmodItna = ssxmodItna;
+
+  await next();
 };
 
 /**
@@ -413,43 +294,201 @@ const authMiddleware: Middleware = async (ctx, next) => {
  * Serves a simple informational HTML page.
  */
 router.get("/", (ctx: Context) => {
-    const htmlContent = `
+  const saltStatus = config.salt ? "🔒 受限访问模式" : "🎯 开放访问模式";
+  const authFormat = config.salt
+    ? "Authorization: Bearer salt_value;qwen_token;ssxmod_itna_value"
+    : "Authorization: Bearer qwen_token;ssxmod_itna_value";
+
+  const htmlContent = `
         <!DOCTYPE html>
-        <html lang="en">
+        <html lang="zh-CN">
         <head>
             <meta charset="UTF-8">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <title>Qwen API Proxy</title>
             <style>
-                body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 40px; background-color: #121212; color: #E0E0E0; }
-                h1, h2 { color: #BB86FC; border-bottom: 2px solid #373737; padding-bottom: 10px; }
-                code { background-color: #333; padding: 2px 6px; border-radius: 4px; font-family: "Courier New", Courier, monospace; }
-                p { line-height: 1.6; }
-                a { color: #03DAC6; text-decoration: none; }
-                a:hover { text-decoration: underline; }
-                .container { max-width: 800px; margin: 0 auto; }
+                * {
+                    margin: 0;
+                    padding: 0;
+                    box-sizing: border-box;
+                }
+                
+                body {
+                    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    min-height: 100vh;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    padding: 20px;
+                }
+                
+                .container {
+                    background: rgba(255, 255, 255, 0.95);
+                    backdrop-filter: blur(10px);
+                    border-radius: 20px;
+                    padding: 40px;
+                    box-shadow: 0 20px 40px rgba(0, 0, 0, 0.1);
+                    max-width: 500px;
+                    width: 100%;
+                    text-align: center;
+                }
+                
+                .status {
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    gap: 8px;
+                    margin-bottom: 12px;
+                }
+                
+                .status-dot {
+                    width: 8px;
+                    height: 8px;
+                    background: #10b981;
+                    border-radius: 50%;
+                    animation: pulse 2s infinite;
+                }
+                
+                @keyframes pulse {
+                    0%, 100% { opacity: 1; }
+                    50% { opacity: 0.5; }
+                }
+                
+                .status-text {
+                    font-size: 18px;
+                    font-weight: 600;
+                    color: #1f2937;
+                }
+                
+                .subtitle {
+                    color: #6b7280;
+                    font-size: 14px;
+                    margin-bottom: 32px;
+                    line-height: 1.5;
+                }
+                
+                .api-section {
+                    text-align: left;
+                    margin-bottom: 32px;
+                }
+                
+                .section-title {
+                    font-size: 16px;
+                    font-weight: 600;
+                    color: #374151;
+                    margin-bottom: 16px;
+                }
+                
+                .api-item {
+                    display: flex;
+                    justify-content: space-between;
+                    align-items: center;
+                    padding: 12px 0;
+                    border-bottom: 1px solid #f3f4f6;
+                }
+                
+                .api-item:last-child {
+                    border-bottom: none;
+                }
+                
+                .api-label {
+                    color: #6b7280;
+                    font-size: 14px;
+                }
+                
+                .api-endpoint {
+                    font-family: "SF Mono", Monaco, "Cascadia Code", "Roboto Mono", Consolas, "Courier New", monospace;
+                    font-size: 13px;
+                    color: #1f2937;
+                    background: #f9fafb;
+                    padding: 4px 8px;
+                    border-radius: 6px;
+                    border: 1px solid #e5e7eb;
+                }
+                
+                .auth-section {
+                    background: #f8fafc;
+                    border: 1px solid #e2e8f0;
+                    border-radius: 12px;
+                    padding: 20px;
+                    margin-bottom: 24px;
+                }
+                
+                .auth-title {
+                    font-size: 14px;
+                    font-weight: 600;
+                    color: #374151;
+                    margin-bottom: 8px;
+                }
+                
+                .auth-status {
+                    font-size: 13px;
+                    color: #059669;
+                    margin-bottom: 12px;
+                }
+                
+                .auth-format {
+                    font-family: "SF Mono", Monaco, "Cascadia Code", "Roboto Mono", Consolas, "Courier New", monospace;
+                    font-size: 11px;
+                    color: #4b5563;
+                    background: #ffffff;
+                    padding: 8px 12px;
+                    border-radius: 6px;
+                    border: 1px solid #d1d5db;
+                    word-break: break-all;
+                    line-height: 1.4;
+                }
+                
+                .footer {
+                    color: #9ca3af;
+                    font-size: 12px;
+                    font-weight: 500;
+                }
+                
+                .version {
+                    color: #6366f1;
+                }
             </style>
         </head>
         <body>
             <div class="container">
-                <h1>🚀 Qwen API Proxy</h1>
-                <p>This server acts as a proxy to convert standard OpenAI API requests into the proprietary format for the Qwen Chat API.</p>
+                <div class="status">
+                    <div class="status-dot"></div>
+                    <div class="status-text">服务运行正常</div>
+                </div>
                 
-                <h2>Available API Endpoints</h2>
-                <ul>
-                    <li><code>GET /v1/models</code> - Retrieves a list of available models.</li>
-                    <li><code>POST /v1/chat/completions</code> - The main endpoint for chat, supporting streaming.</li>
-                </ul>
-
-                <h2>Source Code</h2>
-                <p>The original source code for this project can be found at:</p>
-                <p><a href="https://github.com/highkay/qwenchat2api" target="_blank">https://github.com/highkay/qwenchat2api</a></p>
+                <div class="subtitle">
+                    欲买桂花同载酒，终不似，少年游
+                </div>
+                
+                <div class="api-section">
+                    <div class="section-title">API 端点</div>
+                    <div class="api-item">
+                        <span class="api-label">模型列表</span>
+                        <code class="api-endpoint">/v1/models</code>
+                    </div>
+                    <div class="api-item">
+                        <span class="api-label">聊天完成</span>
+                        <code class="api-endpoint">/v1/chat/completions</code>
+                    </div>
+                </div>
+                
+                <div class="auth-section">
+                    <div class="auth-title">认证方式</div>
+                    <div class="auth-status">${saltStatus}</div>
+                    <div class="auth-format">${authFormat}</div>
+                </div>
+                
+                <div class="footer">
+                    <span class="version">Qwen API Proxy v2.6</span>
+                </div>
             </div>
         </body>
         </html>
     `;
-    ctx.response.body = htmlContent;
-    ctx.response.headers.set("Content-Type", "text/html; charset=utf-8");
+  ctx.response.body = htmlContent;
+  ctx.response.headers.set("Content-Type", "text/html; charset=utf-8");
 });
 
 /**
@@ -457,45 +496,45 @@ router.get("/", (ctx: Context) => {
  * Fetches the model list from Qwen and adds special variants.
  */
 router.get("/v1/models", async (ctx: Context) => {
-    const token = getUpstreamToken();
-    if (!token) {
-        ctx.response.status = 503;
-        ctx.response.body = { error: "Upstream token not configured." };
-        return;
+  const token = ctx.state?.qwenToken;
+  if (!token) {
+    ctx.response.status = 503;
+    ctx.response.body = { error: "Qwen token not provided in Authorization header." };
+    return;
+  }
+
+  try {
+    const response = await fetch('https://chat.qwen.ai/api/models', {
+      headers: { 'Authorization': `Bearer ${token}` },
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to fetch models: ${response.statusText}`);
     }
 
-    try {
-        const response = await fetch('https://chat.qwen.ai/api/models', {
-            headers: { 'Authorization': `Bearer ${token}` },
-        });
+    const originalModels = (await response.json()).data;
+    const processedModels: any[] = [];
 
-        if (!response.ok) {
-            throw new Error(`Failed to fetch models: ${response.statusText}`);
-        }
-
-        const originalModels = (await response.json()).data;
-        const processedModels: any[] = [];
-
-        for (const model of originalModels) {
-            processedModels.push(model);
-            // Add special variants based on original project logic
-            if (model?.info?.meta?.abilities?.thinking) {
-                processedModels.push({ ...model, id: `${model.id}-thinking` });
-            }
-            if (model?.info?.meta?.chat_type?.includes('search')) {
-                processedModels.push({ ...model, id: `${model.id}-search` });
-            }
-             if (model?.info?.meta?.chat_type?.includes('t2i')) {
-                processedModels.push({ ...model, id: `${model.id}-image` });
-            }
-        }
-
-        ctx.response.body = { object: "list", data: processedModels };
-    } catch (err) {
-        console.error("Error fetching models:", err.message);
-        ctx.response.status = 502;
-        ctx.response.body = { error: "Failed to fetch models from upstream API." };
+    for (const model of originalModels) {
+      processedModels.push(model);
+      // Add special variants based on original project logic
+      if (model?.info?.meta?.abilities?.thinking) {
+        processedModels.push({ ...model, id: `${model.id}-thinking` });
+      }
+      if (model?.info?.meta?.chat_type?.includes('search')) {
+        processedModels.push({ ...model, id: `${model.id}-search` });
+      }
+      if (model?.info?.meta?.chat_type?.includes('t2i')) {
+        processedModels.push({ ...model, id: `${model.id}-image` });
+      }
     }
+
+    ctx.response.body = { object: "list", data: processedModels };
+  } catch (err) {
+    console.error("Error fetching models:", err.message);
+    ctx.response.status = 502;
+    ctx.response.body = { error: "Failed to fetch models from upstream API." };
+  }
 });
 
 /**
@@ -503,76 +542,74 @@ router.get("/v1/models", async (ctx: Context) => {
  * The main chat proxy endpoint.
  */
 router.post("/v1/chat/completions", async (ctx: Context) => {
-    const token = getUpstreamToken();
-    if (!token) {
-        ctx.response.status = 503;
-        ctx.response.body = { error: "Upstream token not configured." };
-        return;
+  const token = ctx.state?.qwenToken;
+  const ssxmodItna = ctx.state?.ssxmodItna;
+
+  if (!token) {
+    ctx.response.status = 503;
+    ctx.response.body = { error: "Qwen token not provided in Authorization header." };
+    return;
+  }
+
+  try {
+    const openAIRequest = await ctx.request.body({ type: "json" }).value;
+    const qwenRequest = transformOpenAIRequestToQwen(openAIRequest);
+
+    const headers: Record<string, string> = {
+      'Authorization': `Bearer ${token}`,
+      'Content-Type': 'application/json',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    };
+    if (ssxmodItna) {
+      headers['Cookie'] = `ssxmod_itna=${ssxmodItna}`;
     }
 
-    try {
-        const openAIRequest = await ctx.request.body({ type: "json" }).value;
+    const upstreamResponse = await fetch("https://chat.qwen.ai/api/chat/completions", {
+      method: "POST",
+      headers: headers,
+      body: JSON.stringify(qwenRequest),
+    });
 
-        // Asynchronously process messages for file uploads before transforming the request
-        openAIRequest.messages = await processMessagesForQwen(openAIRequest.messages, token);
-
-        const qwenRequest = transformOpenAIRequestToQwen(openAIRequest);
-
-        const headers: Record<string, string> = {
-            'Authorization': `Bearer ${token}`,
-            'Content-Type': 'application/json',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        };
-        if (config.ssxmodItna) {
-            headers['Cookie'] = `ssxmod_itna=${config.ssxmodItna}`;
-        }
-
-        const upstreamResponse = await fetch("https://chat.qwen.ai/api/chat/completions", {
-            method: "POST",
-            headers: headers,
-            body: JSON.stringify(qwenRequest),
-        });
-
-        if (!upstreamResponse.ok || !upstreamResponse.body) {
-            const errorBody = await upstreamResponse.text();
-            console.error(`Upstream API error: ${upstreamResponse.status}`, errorBody);
-            ctx.response.status = upstreamResponse.status;
-            ctx.response.body = { error: "Upstream API request failed", details: errorBody };
-            return;
-        }
-
-        // Transform the response stream and send it to the client
-        const transformedStream = upstreamResponse.body.pipeThrough(createQwenToOpenAIStreamTransformer());
-
-        ctx.response.body = transformedStream;
-        ctx.response.headers.set("Content-Type", "text/event-stream");
-        ctx.response.headers.set("Cache-Control", "no-cache");
-        ctx.response.headers.set("Connection", "keep-alive");
-
-    } catch (err) {
-        console.error("Error in chat completions proxy:", err.message);
-        ctx.response.status = 500;
-        ctx.response.body = { error: "Internal Server Error" };
+    if (!upstreamResponse.ok || !upstreamResponse.body) {
+      const errorBody = await upstreamResponse.text();
+      console.error(`Upstream API error: ${upstreamResponse.status}`, errorBody);
+      ctx.response.status = upstreamResponse.status;
+      ctx.response.body = { error: "Upstream API request failed", details: errorBody };
+      return;
     }
+
+    // Transform the response stream and send it to the client
+    const transformedStream = upstreamResponse.body.pipeThrough(createQwenToOpenAIStreamTransformer());
+
+    ctx.response.body = transformedStream;
+    ctx.response.headers.set("Content-Type", "text/event-stream");
+    ctx.response.headers.set("Cache-Control", "no-cache");
+    ctx.response.headers.set("Connection", "keep-alive");
+
+  } catch (err) {
+    console.error("Error in chat completions proxy:", err.message);
+    ctx.response.status = 500;
+    ctx.response.body = { error: "Internal Server Error" };
+  }
 });
 
 // Apply middleware
 app.use(authMiddleware);
 app.use(router.routes());
 app.use(router.allowedMethods());
-
 // --- 4. Start Server ---
-
-app.addEventListener("listen", ({ hostname, port }) => {
-    console.log(`🚀 Server listening on http://${hostname ?? "localhost"}:${port}`);
-    console.log("Reading environment variables...");
-    if (config.openaiApiKey) {
-        console.log("✅ OPENAI_API_KEY is set. Authentication is ENABLED.");
-    } else {
-        console.log("⚠️ OPENAI_API_KEY is NOT set. Authentication is DISABLED.");
-    }
-    console.log(config.apiKeys.length > 0 ? "✅ API_KEY (for upstream) is set." : "❌ API_KEY (for upstream) is NOT set.");
-    console.log(config.ssxmodItna ? "✅ SSXMOD_ITNA (cookie) is set." : "⚠️ SSXMOD_ITNA (cookie) is NOT set.");
-});
-
-await app.listen({ port: 8000 });
+console.log("🚀 Starting server...");
+if (config.salt) {
+  console.log("🔒 SALT PROTECTION ENABLED - Restricted access mode");
+  console.log("💡 Clients should provide: Authorization: Bearer salt_value;qwen_token;ssxmod_itna_value");
+  console.log(`🔑 Salt value configured: ${config.salt.substring(0, 3)}***`);
+} else {
+  console.log("🎯 OPEN ACCESS MODE - No salt protection");
+  console.log("💡 Clients should provide: Authorization: Bearer qwen_token;ssxmod_itna_value");
+  console.log("🔓 To enable access control, set SALT environment variable");
+}
+console.log("📝 All authentication is handled via client Authorization headers.");
+// Use the native Deno.serve for deployment.
+// The app.handle method is used as the request handler.
+Deno.serve((req) => app.handle(req));
+console.log(`✅ Server is ready to accept connections.`);
